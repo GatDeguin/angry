@@ -202,7 +202,7 @@
 
     /* ========= Helpers de creación ========= */
     function makeBoxMesh(w,h,d, color){ return new THREE.Mesh(new THREE.BoxGeometry(w,h,d), new THREE.MeshPhongMaterial({ color })); }
-    function addRigidBox(x,y,z, sx,sy,sz, mass, color, asTarget=true) {
+    function addRigidBox(x,y,z, sx,sy,sz, mass, color, asTarget=true, breakable=asTarget) {
       const mesh = makeBoxMesh(sx,sy,sz,color);
       mesh.position.set(x,y,z);
       mesh.castShadow = mesh.receiveShadow = true;
@@ -212,10 +212,82 @@
       body.addShape(new CANNON.Box(new CANNON.Vec3(sx/2, sy/2, sz/2)));
       body.position.set(x,y,z);
       body.typeTag = asTarget ? 'target' : 'debris';
+      body.breakable = breakable;
       world.addBody(body);
 
       if (asTarget) { targets.push(mesh); targetBodies.push(body); targetScoreFlag.set(body, false); }
       else { debrisMeshes.push(mesh); debrisBodies.push(body); }
+
+      if (breakable) {
+        body.addEventListener('collide', (e) => {
+          const rel = new CANNON.Vec3();
+          body.velocity.vsub(e.body.velocity, rel);
+          const speed = rel.length();
+          if (speed > 6) fractureBody(body, speed);
+        });
+      }
+
+      return { mesh, body };
+    }
+
+    function addRigidSphere(x,y,z, radius, mass, color, asTarget=true, breakable=asTarget) {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 20, 16), new THREE.MeshPhongMaterial({ color }));
+      mesh.position.set(x,y,z);
+      mesh.castShadow = mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass, material: matDefault, sleepSpeedLimit: 0.2, sleepTimeLimit: 0.6 });
+      body.addShape(new CANNON.Sphere(radius));
+      body.position.set(x,y,z);
+      body.typeTag = asTarget ? 'target' : 'debris';
+      body.breakable = breakable;
+      world.addBody(body);
+
+      if (asTarget) { targets.push(mesh); targetBodies.push(body); targetScoreFlag.set(body, false); }
+      else { debrisMeshes.push(mesh); debrisBodies.push(body); }
+
+      if (breakable) {
+        body.addEventListener('collide', (e) => {
+          const rel = new CANNON.Vec3();
+          body.velocity.vsub(e.body.velocity, rel);
+          const speed = rel.length();
+          if (speed > 6) fractureBody(body, speed);
+        });
+      }
+
+      return { mesh, body };
+    }
+
+    function addRigidCylinder(x,y,z, radius,height, mass, color, asTarget=true, breakable=asTarget) {
+      const mesh = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, height, 16), new THREE.MeshPhongMaterial({ color }));
+      mesh.position.set(x,y,z);
+      mesh.castShadow = mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass, material: matDefault, sleepSpeedLimit: 0.2, sleepTimeLimit: 0.6 });
+      const shape = new CANNON.Cylinder(radius, radius, height, 16);
+      const quat = new CANNON.Quaternion();
+      quat.setFromEuler(Math.PI/2, 0, 0);
+      const trans = new CANNON.Vec3();
+      shape.transformAllPoints(trans, quat);
+      body.addShape(shape);
+      body.position.set(x,y,z);
+      body.typeTag = asTarget ? 'target' : 'debris';
+      body.breakable = breakable;
+      world.addBody(body);
+
+      if (asTarget) { targets.push(mesh); targetBodies.push(body); targetScoreFlag.set(body, false); }
+      else { debrisMeshes.push(mesh); debrisBodies.push(body); }
+
+      if (breakable) {
+        body.addEventListener('collide', (e) => {
+          const rel = new CANNON.Vec3();
+          body.velocity.vsub(e.body.velocity, rel);
+          const speed = rel.length();
+          if (speed > 6) fractureBody(body, speed);
+        });
+      }
+
       return { mesh, body };
     }
 
@@ -224,7 +296,11 @@
       const startZ = -12, startY = 0.7, startX = -((cols - 1) * 1.2) / 2;
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
-          addRigidBox(startX + c*1.2, startY + r*1.05, startZ, 1,1,1, 1, 0x8db3ff, true);
+          const x = startX + c*1.2, y = startY + r*1.05, z = startZ;
+          const rand = Math.random();
+          if (rand < 0.33) addRigidBox(x, y, z, 1,1,1, 1, 0x8db3ff, true);
+          else if (rand < 0.66) addRigidSphere(x, y, z, 0.55, 1, 0xff9da7, true);
+          else addRigidCylinder(x, y, z, 0.55, 1, 1, 0xa0e4a0, true);
         }
       }
     }
@@ -235,6 +311,17 @@
       for (let y = 0; y < 3; y++) {
         const count = 5 - y*2, offsetX = baseX - (count-1)*0.6/2;
         for (let i = 0; i < count; i++) addRigidBox(offsetX + i*0.6, 0.5 + y*0.6, baseZ, 0.55,0.55,0.55, 0.5, 0x9cd67a, true);
+      }
+      // torre de cilindros
+      for (let i = 0; i < 4; i++) addRigidCylinder(-8, 0.5 + i*1.05, -14, 0.55, 1, 0.9, 0xd4a5ff, true);
+      // pila de esferas
+      for (let i = 0; i < 3; i++) addRigidSphere(8, 0.5 + i*1.1, -14, 0.55, 1, 0xffb3b3, true);
+      // pirámide de cajas
+      const pyZ = -16;
+      for (let y = 0; y < 3; y++) {
+        const count = 3 - y;
+        const offsetX = - (count - 1) * 0.6 / 2;
+        for (let i = 0; i < count; i++) addRigidBox(offsetX + i*0.6, 0.5 + y*0.6, pyZ, 0.55,0.55,0.55, 0.5, 0xb0c4de, true);
       }
       addRigidBox(-2, 0.8, -10, 0.7,1.6,0.7, 1.2, 0x7f8cff, true);
       addRigidBox( 2, 0.8, -10, 0.7,1.6,0.7, 1.2, 0x7f8cff, true);
@@ -268,7 +355,7 @@
         const hitPos = new THREE.Vector3().copy(sphere.position);
         if (speed > 4) spawnExplosionFX(hitPos, 0xffa84a, Math.min(180, 60+speed*10), Math.min(12, 6+speed*0.6));
         else spawnDustFX(hitPos);
-        if (other && other.typeTag === 'target') breakTargetBody(other, speed);
+        if (other && other.breakable) fractureBody(other, speed);
         removeProjectile(body, sphere);
       });
 
@@ -280,26 +367,33 @@
       if (i !== -1) { world.removeBody(body); scene.remove(mesh); projectileBodies.splice(i,1); projectiles.splice(i,1); }
     }
 
-    /* ========= Romper en escombros ========= */
-    function breakTargetBody(body, strength=6) {
-      const idx = targetBodies.indexOf(body);
-      if (idx === -1) return;
-      const pos = targetBodies[idx].position.clone();
-      const mesh = targets[idx];
+    /* ========= Fracturas dinámicas ========= */
+    function fractureBody(body, strength=6) {
+      let idx = targetBodies.indexOf(body);
+      let arrBodies = targetBodies, arrMeshes = targets;
+      let isTarget = true;
+      if (idx === -1) {
+        idx = debrisBodies.indexOf(body);
+        if (idx === -1) return;
+        arrBodies = debrisBodies; arrMeshes = debrisMeshes; isTarget = false;
+      }
+      const pos = arrBodies[idx].position.clone();
+      const mesh = arrMeshes[idx];
+      const color = mesh.material?.color?.getHex?.() ?? 0xb0b7c3;
       world.removeBody(body); scene.remove(mesh);
-      targetBodies.splice(idx,1); targets.splice(idx,1);
+      arrBodies.splice(idx,1); arrMeshes.splice(idx,1);
 
-      const count = 4 + Math.floor(Math.random()*3);
+      const count = Math.min(12, 3 + Math.floor(strength));
       for (let i = 0; i < count; i++) {
-        const sx = 0.45 + Math.random()*0.25;
-        const sy = 0.35 + Math.random()*0.25;
-        const sz = 0.45 + Math.random()*0.25;
+        const sx = 0.35 + Math.random()*0.3;
+        const sy = 0.35 + Math.random()*0.3;
+        const sz = 0.35 + Math.random()*0.3;
         const jitter = new THREE.Vector3( (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4 );
-        const { body:dbody } = addRigidBox(pos.x + jitter.x, pos.y + jitter.y, pos.z + jitter.z, sx,sy,sz, 0.25, 0xb0b7c3, false);
+        const { body:dbody } = addRigidBox(pos.x + jitter.x, pos.y + jitter.y, pos.z + jitter.z, sx,sy,sz, 0.2, color, false, strength > 8);
         dbody.velocity.set( (Math.random()-0.5)*strength, Math.random()*strength*0.6, (Math.random()-0.5)*strength );
         dbody.angularVelocity.set( (Math.random()-0.5)*4, (Math.random()-0.5)*4, (Math.random()-0.5)*4 );
       }
-      score += 1; scoreEl.textContent = String(score);
+      if (isTarget) { score += 1; scoreEl.textContent = String(score); }
     }
 
     /* ========= Sincronización malla<->cuerpo ========= */
