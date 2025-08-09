@@ -714,11 +714,10 @@
     let RAF = 0;
     let last = performance.now();
     function loop(now = performance.now()) {
-      RAF = requestAnimationFrame(loop);
       const dt = Math.min(0.033, (now - last) / 1000);
       last = now;
 
-      world.step(1/60, dt, 3);
+      world.step(1/60, dt, 1); // reduce substeps for smoother frames
       syncMeshes();
       updateScoreByFall();
 
@@ -729,6 +728,7 @@
 
       renderer.render(scene, camera);
       drawOverlay();
+      RAF = requestAnimationFrame(loop);
     }
 
     /* ========= Resize ========= */
