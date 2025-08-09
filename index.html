@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Gomera 3D – FX + Partículas + Estructuras + Mano HUD</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background:#0b0e13; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #overlay, #three-canvas { position: absolute; inset: 0; display: block; }
+    #overlay { pointer-events: none; }
+    #webcam { position: fixed; right: 12px; bottom: 12px; width: 200px; transform: scaleX(-1); border-radius: 8px; opacity: .2; }
+    #hud {
+      position: fixed; left: 12px; top: 12px; color: #e6edf3; z-index: 10;
+      backdrop-filter: blur(8px); background: rgba(0,0,0,.25); padding: 10px 12px; border-radius: 10px; line-height: 1.2;
+      box-shadow: 0 6px 24px rgba(0,0,0,.35);
+    }
+    #hud small { opacity: .8; display: block; margin-top: 6px; }
+    #hud .row { display: flex; gap: 12px; align-items: baseline; }
+    #hud .big { font-size: 28px; font-weight: 700; letter-spacing: .3px; }
+    #startBtn {
+      position: fixed; inset: 0; margin: auto; width: min(92%, 420px); height: 64px; border-radius: 14px;
+      background: linear-gradient(180deg, #2ea043, #238636); color: white; font-size: 18px; font-weight: 700; border: 0; cursor: pointer;
+      box-shadow: 0 12px 40px rgba(0,0,0,.35); z-index: 20;
+    }
+    #toast {
+      position: fixed; left: 50%; transform: translateX(-50%); bottom: 16px; color: #c9d1d9; background: rgba(0,0,0,.45);
+      padding: 8px 12px; border-radius: 10px; z-index: 10; font-size: 13px;
+    }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <!-- Canvas 3D (Three.js) -->
+  <canvas id="three-canvas"></canvas>
+  <!-- Canvas HUD/overlay 2D -->
+  <canvas id="overlay"></canvas>
+
+  <!-- Vista previa de webcam (volteada), opcional -->
+  <video id="webcam" class="hidden" playsinline></video>
+
+  <!-- HUD -->
+  <div id="hud">
+    <div class="row"><div>🎯 Puntos:</div> <div id="score" class="big">0</div></div>
+    <div class="row"><div>💪 Potencia:</div> <div id="power">0%</div></div>
+    <small>Pincha (pulgar+índice) para tensar la gomera. Arrastra y suelta para disparar. Mueve la mano para apuntar. Teclas: R (reset), E (estructuras), H (webcam).</small>
+  </div>
+
+  <button id="startBtn">Activar cámara y jugar</button>
+  <div id="toast" class="hidden">Buscando mano… procura buena luz</div>
+
+  <!-- MediaPipe Hands (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <!-- App -->
+  <script type="module">
+    /* ========= IMPORTS ========= */
+    import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+    import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
+
+    /* ========= GUARD (evitar dobles instancias si el HTML quedó duplicado) ========= */
+    if (window.__GOMERA__) { try { window.__GOMERA__.dispose?.(); } catch {} }
+    window.__GOMERA__ = {};
+
+    /* ========= DOM refs ========= */
+    const threeCanvas = document.getElementById('three-canvas');
+    const overlay = document.getElementById('overlay');
+    const octx = overlay.getContext('2d');
+    const webcamEl = document.getElementById('webcam');
+    const startBtn = document.getElementById('startBtn');
+    const scoreEl = document.getElementById('score');
+    const powerEl = document.getElementById('power');
+    const toast = document.getElementById('toast');
+
+    /* ========= Utils ========= */
+    const DPR = Math.min(2, window.devicePixelRatio || 1);
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const tmpV3 = new THREE.Vector3();
+
+    /* ========= 3D Scene ========= */
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e13);
+
+    const camera = new THREE.PerspectiveCamera(65, 1, 0.1, 250);
+    const renderer = new THREE.WebGLRenderer({ canvas: threeCanvas, antialias: true });
+    renderer.setPixelRatio(DPR);
+
+    // POV
+    camera.position.set(0, 1.6, 8);
+    camera.lookAt(0, 1.2, 0);
+
+    // Luces
+    const amb = new THREE.AmbientLight(0xffffff, 0.55); scene.add(amb);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9); dir.position.set(5, 9, 6); scene.add(dir);
+
+    // Suelo visual
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(120, 120),
+                                  new THREE.MeshPhongMaterial({ color: 0x1d2432, shininess: 10 }));
+    ground.rotation.x = -Math.PI/2;
+    scene.add(ground);
+
+    // Plataforma
+    const platform = new THREE.Mesh(new THREE.BoxGeometry(20, 0.4, 20),
+                                    new THREE.MeshPhongMaterial({ color: 0x33415c }));
+    platform.position.set(0, 0.2, -12);
+    scene.add(platform);
+
+    /* ========= Mundo físico ========= */
+    const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.allowSleep = true;
+
+    const matDefault = new CANNON.Material('default');
+    const contact = new CANNON.ContactMaterial(matDefault, matDefault, { friction: 0.3, restitution: 0.2 });
+    world.addContactMaterial(contact);
+
+    // Suelo físico
+    const groundBody = new CANNON.Body({ mass: 0, material: matDefault });
+    groundBody.addShape(new CANNON.Plane());
+    groundBody.quaternion.setFromEuler(-Math.PI/2, 0, 0);
+    groundBody.typeTag = 'ground';
+    world.addBody(groundBody);
+
+    // Plataforma física
+    const platformBody = new CANNON.Body({ mass: 0, material: matDefault });
+    platformBody.addShape(new CANNON.Box(new CANNON.Vec3(10, 0.2, 10)));
+    platformBody.position.set(0, 0.2, -12);
+    platformBody.typeTag = 'ground';
+    world.addBody(platformBody);
+
+    /* ========= Contenedores ========= */
+    const targets = [];           // THREE.Mesh
+    const targetBodies = [];      // CANNON.Body
+    const targetScoreFlag = new WeakMap(); // para no sumar doble
+    const projectiles = [];
+    const projectileBodies = [];
+    const debrisMeshes = [];
+    const debrisBodies = [];
+
+    /* ========= FX de partículas ========= */
+    const fxList = []; // elementos con { update(dt), alive, dispose() }
+    function spawnExplosionFX(pos, color = 0xffa84a, count = 120, power = 9) {
+      const geom = new THREE.BufferGeometry();
+      const positions = new Float32Array(count * 3);
+      const velocities = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        positions[i*3+0] = pos.x;
+        positions[i*3+1] = pos.y;
+        positions[i*3+2] = pos.z;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2*Math.random() - 1);
+        const s = (Math.random()*0.6 + 0.4) * power;
+        const vx = Math.sin(phi) * Math.cos(theta) * s;
+        const vy = Math.cos(phi) * s * 0.7 + 2.0;
+        const vz = Math.sin(phi) * Math.sin(theta) * s;
+        velocities[i*3+0] = vx; velocities[i*3+1] = vy; velocities[i*3+2] = vz;
+      }
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.PointsMaterial({ color, size: 0.16, sizeAttenuation: true, transparent: true, opacity: 1.0, depthWrite: false, blending: THREE.AdditiveBlending });
+      const points = new THREE.Points(geom, mat);
+      scene.add(points);
+      const fx = {
+        life: 1.0,
+        update(dt){
+          this.life -= dt * 1.2;
+          const p = geom.attributes.position.array;
+          for (let i = 0; i < count; i++) {
+            velocities[i*3+1] -= 9.82 * dt * 0.8;
+            velocities[i*3+0] *= (1 - 0.9*dt);
+            velocities[i*3+1] *= (1 - 0.8*dt);
+            velocities[i*3+2] *= (1 - 0.9*dt);
+            p[i*3+0] += velocities[i*3+0] * dt;
+            p[i*3+1] += velocities[i*3+1] * dt;
+            p[i*3+2] += velocities[i*3+2] * dt;
+          }
+          geom.attributes.position.needsUpdate = true;
+          mat.opacity = Math.max(0, this.life);
+        },
+        get alive(){ return this.life > 0; },
+        dispose(){ scene.remove(points); geom.dispose(); }
+      };
+      fxList.push(fx);
+
+      // Shockwave (anillo)
+      const ringGeom = new THREE.RingGeometry(0.1, 0.11, 40);
+      const ringMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false });
+      const ring = new THREE.Mesh(ringGeom, ringMat);
+      ring.rotation.x = -Math.PI/2;
+      ring.position.copy(pos);
+      scene.add(ring);
+      const wave = {
+        r: 0.1, life: 0.8,
+        update(dt){ this.r += 8*dt; ring.scale.setScalar(this.r); ringMat.opacity = Math.max(0, this.life); this.life -= dt; },
+        get alive(){ return this.life > 0; },
+        dispose(){ scene.remove(ring); ringGeom.dispose(); }
+      };
+      fxList.push(wave);
+    }
+    function spawnDustFX(pos, color = 0xaaaaaa) { spawnExplosionFX(new THREE.Vector3(pos.x, pos.y+0.1, pos.z), color, 30, 3.5); }
+
+    /* ========= Helpers de creación ========= */
+    function makeBoxMesh(w,h,d, color){ return new THREE.Mesh(new THREE.BoxGeometry(w,h,d), new THREE.MeshPhongMaterial({ color })); }
+    function addRigidBox(x,y,z, sx,sy,sz, mass, color, asTarget=true) {
+      const mesh = makeBoxMesh(sx,sy,sz,color);
+      mesh.position.set(x,y,z);
+      mesh.castShadow = mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const body = new CANNON.Body({ mass, material: matDefault, sleepSpeedLimit: 0.2, sleepTimeLimit: 0.6 });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sx/2, sy/2, sz/2)));
+      body.position.set(x,y,z);
+      body.typeTag = asTarget ? 'target' : 'debris';
+      world.addBody(body);
+
+      if (asTarget) { targets.push(mesh); targetBodies.push(body); targetScoreFlag.set(body, false); }
+      else { debrisMeshes.push(mesh); debrisBodies.push(body); }
+      return { mesh, body };
+    }
+
+    /* ========= Objetivos base (muro) ========= */
+    function addTargets(rows=4, cols=5) {
+      const startZ = -12, startY = 0.7, startX = -((cols - 1) * 1.2) / 2;
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          addRigidBox(startX + c*1.2, startY + r*1.05, startZ, 1,1,1, 1, 0x8db3ff, true);
+        }
+      }
+    }
+    /* ========= Estructuras extra y "personajes" ========= */
+    function addStructures() {
+      for (let i = 0; i < 6; i++) addRigidBox(6, 0.5 + i*1.05, -14, 1,1,1, 0.9, 0xf2b880, true);
+      const baseX = -6, baseZ = -13;
+      for (let y = 0; y < 3; y++) {
+        const count = 5 - y*2, offsetX = baseX - (count-1)*0.6/2;
+        for (let i = 0; i < count; i++) addRigidBox(offsetX + i*0.6, 0.5 + y*0.6, baseZ, 0.55,0.55,0.55, 0.5, 0x9cd67a, true);
+      }
+      addRigidBox(-2, 0.8, -10, 0.7,1.6,0.7, 1.2, 0x7f8cff, true);
+      addRigidBox( 2, 0.8, -10, 0.7,1.6,0.7, 1.2, 0x7f8cff, true);
+      const man = (cx, cz, colorHead=0xffe0bd, colorBody=0xc0c6d5) => {
+        addRigidBox(cx, 1.8, cz, 0.4,0.4,0.4, 0.4, colorHead, true);
+        addRigidBox(cx, 1.2, cz, 0.6,0.7,0.3, 0.8, colorBody, true);
+        addRigidBox(cx, 0.5, cz, 0.6,0.7,0.3, 0.8, colorBody, true);
+      };
+      man(-9, -12.5); man(9, -12.5, 0xffe0bd, 0xaec9ff);
+    }
+    addTargets(); addStructures();
+
+    /* ========= Proyectiles ========= */
+    function spawnProjectile(pos, velocity) {
+      const radius = 0.25;
+      const sphere = new THREE.Mesh(new THREE.SphereGeometry(radius, 20, 16), new THREE.MeshPhongMaterial({ color: 0xffc857 }));
+      scene.add(sphere);
+
+      const body = new CANNON.Body({ mass: 1, material: matDefault });
+      body.addShape(new CANNON.Sphere(radius));
+      body.position.set(pos.x, pos.y, pos.z);
+      body.velocity.set(velocity.x, velocity.y, velocity.z);
+      body.typeTag = 'projectile';
+      world.addBody(body);
+
+      body.addEventListener('collide', (e) => {
+        const other = e.body;
+        const rel = new CANNON.Vec3();
+        body.velocity.vsub(other.velocity, rel);
+        const speed = rel.length();
+        const hitPos = new THREE.Vector3().copy(sphere.position);
+        if (speed > 4) spawnExplosionFX(hitPos, 0xffa84a, Math.min(180, 60+speed*10), Math.min(12, 6+speed*0.6));
+        else spawnDustFX(hitPos);
+        if (other && other.typeTag === 'target') breakTargetBody(other, speed);
+        removeProjectile(body, sphere);
+      });
+
+      projectiles.push(sphere);
+      projectileBodies.push(body);
+    }
+    function removeProjectile(body, mesh) {
+      const i = projectileBodies.indexOf(body);
+      if (i !== -1) { world.removeBody(body); scene.remove(mesh); projectileBodies.splice(i,1); projectiles.splice(i,1); }
+    }
+
+    /* ========= Romper en escombros ========= */
+    function breakTargetBody(body, strength=6) {
+      const idx = targetBodies.indexOf(body);
+      if (idx === -1) return;
+      const pos = targetBodies[idx].position.clone();
+      const mesh = targets[idx];
+      world.removeBody(body); scene.remove(mesh);
+      targetBodies.splice(idx,1); targets.splice(idx,1);
+
+      const count = 4 + Math.floor(Math.random()*3);
+      for (let i = 0; i < count; i++) {
+        const sx = 0.45 + Math.random()*0.25;
+        const sy = 0.35 + Math.random()*0.25;
+        const sz = 0.45 + Math.random()*0.25;
+        const jitter = new THREE.Vector3( (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4, (Math.random()-0.5)*0.4 );
+        const { body:dbody } = addRigidBox(pos.x + jitter.x, pos.y + jitter.y, pos.z + jitter.z, sx,sy,sz, 0.25, 0xb0b7c3, false);
+        dbody.velocity.set( (Math.random()-0.5)*strength, Math.random()*strength*0.6, (Math.random()-0.5)*strength );
+        dbody.angularVelocity.set( (Math.random()-0.5)*4, (Math.random()-0.5)*4, (Math.random()-0.5)*4 );
+      }
+      score += 1; scoreEl.textContent = String(score);
+    }
+
+    /* ========= Sincronización malla<->cuerpo ========= */
+    function syncMeshes() {
+      for (let i = 0; i < projectileBodies.length; i++) {
+        const b = projectileBodies[i], m = projectiles[i];
+        m.position.copy(b.position); m.quaternion.copy(b.quaternion);
+        if (b.position.y < -20 || Math.abs(b.position.z) > 120) { removeProjectile(b, m); i--; }
+      }
+      for (let i = 0; i < targetBodies.length; i++) {
+        const b = targetBodies[i], m = targets[i];
+        m.position.copy(b.position); m.quaternion.copy(b.quaternion);
+      }
+      for (let i = 0; i < debrisBodies.length; i++) {
+        const b = debrisBodies[i], m = debrisMeshes[i];
+        m.position.copy(b.position); m.quaternion.copy(b.quaternion);
+        if (b.position.y < -20 || Math.abs(b.position.z) > 140) {
+          world.removeBody(b); scene.remove(m); debrisBodies.splice(i,1); debrisMeshes.splice(i,1); i--;
+        }
+      }
+    }
+
+    /* ========= Puntuación por caída ========= */
+    let score = 0;
+    function updateScoreByFall() {
+      for (const b of targetBodies) {
+        if (!targetScoreFlag.get(b)) {
+          if (b.position.y < 0.25 || Math.abs(b.position.z) > 40) {
+            targetScoreFlag.set(b, true);
+            score += 1; scoreEl.textContent = String(score);
+            spawnDustFX(new THREE.Vector3(b.position.x, b.position.y, b.position.z), 0x888888);
+          }
+        }
+      }
+    }
+
+    /* ========= Seguimiento de mano (MediaPipe Hands) + VIZ ========= */
+    const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
+    // Feedback visual
+    const MIRROR_X = true;                 // coincide con la webcam espejada
+    const HAND_CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],            // pulgar
+      [0,5],[5,6],[6,7],[7,8],            // índice
+      [5,9],[9,10],[10,11],[11,12],       // medio
+      [9,13],[13,14],[14,15],[15,16],     // anular
+      [13,17],[17,18],[18,19],[19,20],    // meñique
+      [0,17]                               // base palma
+    ];
+    let lastLandmarks = null;
+    let lastDetectedAt = 0;
+    let handLabel = '', handScore = 0;
+    const pinchTrail = [];
+
+    // Estado de gesto y puntería
+    const anchor = { x: 0.5, y: 0.8 };
+    let pinchNow = false, pinchPrev = false;
+    let pinchPos = { x: 0.5, y: 0.8 };
+    let pinchPosSmooth = { ...pinchPos };
+    let charging = false;
+    let lastShotAt = 0;
+
+    const MAX_PULL = 0.35;
+    const MAX_YAW = 0.55;
+    const MAX_PITCH = 0.45;
+    const MAX_SPEED = 40;
+    const COOLDOWN_MS = 350;
+
+    function smoothVec2(from, to, s=0.35) { return { x: lerp(from.x, to.x, s), y: lerp(from.y, to.y, s) }; }
+
+    // Detección de pellizco
+    function detectPinch(multiHandLandmarks) {
+      if (!multiHandLandmarks || !multiHandLandmarks.length) return { active: false, pos: pinchPos };
+      const lm = multiHandLandmarks[0];
+      const t = lm[4], i = lm[8];
+      const dx = t.x - i.x, dy = t.y - i.y;
+      const dist = Math.hypot(dx, dy);
+      const active = dist < 0.05;
+      const posRaw = { x: (t.x + i.x) * 0.5, y: (t.y + i.y) * 0.5 };
+      const pos = { x: MIRROR_X ? 1 - posRaw.x : posRaw.x, y: posRaw.y };
+      return { active, pos };
+    }
+
+    hands.onResults((results) => {
+      const { multiHandLandmarks, multiHandedness } = results;
+
+      // Guardamos landmarks espejados para dibujar
+      if (multiHandLandmarks && multiHandLandmarks.length) {
+        const raw = multiHandLandmarks[0];
+        lastLandmarks = raw.map(p => ({ x: MIRROR_X ? 1 - p.x : p.x, y: p.y, z: p.z }));
+        lastDetectedAt = performance.now();
+      } else {
+        lastLandmarks = null;
+      }
+
+      // Mano izq/der + score (si viene)
+      if (multiHandedness && multiHandedness.length) {
+        handLabel = multiHandedness[0].label || '';
+        handScore = multiHandedness[0].score || 0;
+      }
+
+      // Pinch/gesto
+      const det = detectPinch(multiHandLandmarks);
+      pinchPrev = pinchNow;
+      pinchNow = det.active;
+      pinchPos = det.pos ? det.pos : pinchPos;
+
+      // Estela del pellizco
+      pinchTrail.push({ x: pinchPos.x, y: pinchPos.y, t: performance.now() });
+      if (pinchTrail.length > 40) pinchTrail.shift();
+
+      toast.classList.toggle('hidden', !!multiHandLandmarks && multiHandLandmarks.length > 0);
+
+      pinchPosSmooth = smoothVec2(pinchPosSmooth, pinchPos, 0.45);
+
+      const now = performance.now();
+      const nearAnchor = Math.hypot(pinchPos.x - anchor.x, pinchPos.y - anchor.y) < 0.25;
+
+      if (!pinchPrev && pinchNow && nearAnchor && !charging && (now - lastShotAt) > COOLDOWN_MS) charging = true;
+      if (pinchPrev && !pinchNow && charging) {
+        const { yaw, pitch, power } = computeAim();
+        shoot(yaw, pitch, power);
+        charging = false; lastShotAt = now;
+      }
+    });
+
+    let mpCamera = null;
+    async function startCamera() {
+      mpCamera = new Camera(webcamEl, { onFrame: async () => { await hands.send({ image: webcamEl }); }, width: 640, height: 480 });
+      await mpCamera.start();
+      webcamEl.classList.remove('hidden');
+    }
+
+    /* ========= Conversión gesto -> disparo ========= */
+    function computeAim() {
+      const dx = clamp(pinchPosSmooth.x - anchor.x, -MAX_PULL, MAX_PULL);
+      const dy = clamp(anchor.y - pinchPosSmooth.y, -MAX_PULL, MAX_PULL);
+      const dist = Math.hypot(dx, dy);
+      const power = clamp(dist / MAX_PULL, 0, 1);
+      const yaw = clamp((dx / MAX_PULL) * MAX_YAW, -MAX_YAW, MAX_YAW);
+      const pitch = clamp((dy / MAX_PULL) * MAX_PITCH, -MAX_PITCH, MAX_PITCH);
+      return { yaw, pitch, power };
+    }
+    function shoot(yaw, pitch, power) {
+      const dir = new THREE.Vector3();
+      camera.getWorldDirection(dir);
+      dir.applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+      const right = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+      dir.applyAxisAngle(right, pitch);
+      dir.normalize();
+      const origin = camera.position.clone().add(dir.clone().multiplyScalar(1.0));
+      const speed = lerp(8, MAX_SPEED, power);
+      const vel = dir.clone().multiplyScalar(speed);
+      spawnProjectile(origin, vel);
+    }
+
+    /* ========= HUD y feedback de mano ========= */
+    const proj = new THREE.Vector3();
+    function predictAimPoint(yaw, pitch) {
+      const dir = new THREE.Vector3();
+      camera.getWorldDirection(dir);
+      dir.applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+      const right = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+      dir.applyAxisAngle(right, pitch);
+      dir.normalize();
+      const farPoint = camera.position.clone().add(dir.multiplyScalar(30));
+      proj.copy(farPoint).project(camera);
+      const x = (proj.x * 0.5 + 0.5) * overlay.width;
+      const y = (-proj.y * 0.5 + 0.5) * overlay.height;
+      return { x, y };
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+      const rr = Math.min(r, w/2, h/2);
+      ctx.beginPath();
+      ctx.moveTo(x+rr, y);
+      ctx.arcTo(x+w, y, x+w, y+h, rr);
+      ctx.arcTo(x+w, y+h, x, y+h, rr);
+      ctx.arcTo(x, y+h, x, y, rr);
+      ctx.arcTo(x, y, x+w, y, rr);
+      ctx.closePath();
+    }
+
+    function drawHandViz() {
+      const w = overlay.width, h = overlay.height;
+      const now = performance.now();
+      const seenRecently = (now - lastDetectedAt) < 350;
+      const fade = seenRecently ? 1 : clamp(1 - (now - lastDetectedAt)/600, 0, 1);
+
+      // Estela del pellizco
+      if (pinchTrail.length > 1) {
+        octx.lineWidth = 6 * DPR;
+        octx.lineCap = 'round';
+        for (let i = 1; i < pinchTrail.length; i++) {
+          const p0 = pinchTrail[i-1], p1 = pinchTrail[i];
+          const a = i / pinchTrail.length;
+          octx.strokeStyle = `rgba(255,208,0,${0.06*a})`;
+          octx.beginPath();
+          octx.moveTo(p0.x * w, p0.y * h);
+          octx.lineTo(p1.x * w, p1.y * h);
+          octx.stroke();
+        }
+      }
+
+      if (!lastLandmarks || fade <= 0) return;
+
+      // Conectores (huesos)
+      octx.save();
+      octx.globalAlpha = 0.85 * fade;
+      octx.lineWidth = 3 * DPR;
+      octx.strokeStyle = 'rgba(0,255,204,0.6)';
+      for (const [a, b] of HAND_CONNECTIONS) {
+        const pa = lastLandmarks[a], pb = lastLandmarks[b];
+        octx.beginPath();
+        octx.moveTo(pa.x * w, pa.y * h);
+        octx.lineTo(pb.x * w, pb.y * h);
+        octx.stroke();
+      }
+
+      // Landmarks (puntos)
+      octx.fillStyle = 'rgba(255,255,255,0.9)';
+      for (let i = 0; i < lastLandmarks.length; i++) {
+        const p = lastLandmarks[i];
+        const r = (i === 4 || i === 8) ? 5 * DPR : 3.5 * DPR; // destacar pulgar/índice
+        octx.beginPath();
+        octx.arc(p.x * w, p.y * h, r, 0, Math.PI*2);
+        octx.fill();
+      }
+
+      // Flecha orientación (muñeca -> base índice)
+      const wrist = lastLandmarks[0], baseIndex = lastLandmarks[5];
+      const wx = wrist.x * w, wy = wrist.y * h, ix = baseIndex.x * w, iy = baseIndex.y * h;
+      octx.strokeStyle = 'rgba(173,216,230,0.9)';
+      octx.lineWidth = 4 * DPR;
+      octx.beginPath(); octx.moveTo(wx, wy); octx.lineTo(ix, iy); octx.stroke();
+      // cabecita de flecha
+      const ang = Math.atan2(iy - wy, ix - wx);
+      const ah = 10 * DPR;
+      octx.beginPath();
+      octx.moveTo(ix, iy);
+      octx.lineTo(ix - ah*Math.cos(ang - 0.3), iy - ah*Math.sin(ang - 0.3));
+      octx.lineTo(ix - ah*Math.cos(ang + 0.3), iy - ah*Math.sin(ang + 0.3));
+      octx.closePath();
+      octx.fillStyle = 'rgba(173,216,230,0.9)';
+      octx.fill();
+
+      // Bounding box de la mano
+      let minX=1e9, minY=1e9, maxX=-1e9, maxY=-1e9;
+      for (const p of lastLandmarks) {
+        const px = p.x * w, py = p.y * h;
+        minX = Math.min(minX, px); minY = Math.min(minY, py);
+        maxX = Math.max(maxX, px); maxY = Math.max(maxY, py);
+      }
+      const pad = 12 * DPR;
+      roundRect(octx, minX-pad, minY-pad, (maxX-minX)+pad*2, (maxY-minY)+pad*2, 10*DPR);
+      octx.strokeStyle = `rgba(0,255,204,${0.5*fade})`;
+      octx.lineWidth = 2 * DPR;
+      octx.stroke();
+
+      // Etiqueta mano (izq/der)
+      if (handLabel) {
+        octx.font = `${12*DPR}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+        octx.fillStyle = 'rgba(255,255,255,0.9)';
+        octx.fillText(`${handLabel} ${(handScore*100|0)}%`, minX, minY - 8*DPR);
+      }
+
+      octx.restore();
+    }
+
+    function drawOverlay() {
+      const w = overlay.width, h = overlay.height;
+      octx.clearRect(0, 0, w, h);
+
+      // Feedback visual de la mano
+      drawHandViz();
+
+      // HUD de apuntado/carga
+      const ax = anchor.x * w, ay = anchor.y * h;
+      const px = pinchPosSmooth.x * w, py = pinchPosSmooth.y * h;
+      const { power } = computeAim();
+      powerEl.textContent = Math.round(power * 100) + '%';
+
+      // guía circular del ancla
+      octx.beginPath(); octx.arc(ax, ay, 80, 0, Math.PI*2);
+      octx.lineWidth = 2 * DPR; octx.strokeStyle = 'rgba(255,255,255,0.25)'; octx.stroke();
+
+      // cursor del pellizco (siempre visible)
+      octx.beginPath(); octx.arc(px, py, 10*DPR, 0, Math.PI*2);
+      octx.lineWidth = 2 * DPR; octx.strokeStyle = pinchNow ? 'rgba(255,208,0,0.95)' : 'rgba(255,255,255,0.4)'; octx.stroke();
+
+      // aro de carga (si se está tensando)
+      if (charging) {
+        octx.beginPath();
+        octx.arc(px, py, 16*DPR, -Math.PI/2, -Math.PI/2 + power * Math.PI*2);
+        octx.lineWidth = 6 * DPR;
+        octx.strokeStyle = 'rgba(255,208,0,0.9)';
+        octx.stroke();
+
+        // banda elástica
+        octx.beginPath();
+        octx.moveTo(ax - 28, ay);
+        octx.lineTo(px, py);
+        octx.lineTo(ax + 28, ay);
+        octx.lineWidth = lerp(4, 10, power) * DPR;
+        octx.strokeStyle = 'rgba(255,208,0,0.9)';
+        octx.stroke();
+
+        // punto de mira (predicción)
+        const { yaw, pitch } = computeAim();
+        const aim = predictAimPoint(yaw, pitch);
+        octx.beginPath(); octx.arc(aim.x, aim.y, 10 * DPR, 0, Math.PI*2);
+        octx.lineWidth = 3 * DPR; octx.strokeStyle = 'rgba(255,255,255,0.9)'; octx.stroke();
+      }
+    }
+
+    /* ========= Loop ========= */
+    let RAF = 0;
+    let last = performance.now();
+    function loop(now = performance.now()) {
+      RAF = requestAnimationFrame(loop);
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+
+      world.step(1/60, dt, 3);
+      syncMeshes();
+      updateScoreByFall();
+
+      for (let i = 0; i < fxList.length; i++) {
+        fxList[i].update(dt);
+        if (!fxList[i].alive) { fxList[i].dispose(); fxList.splice(i,1); i--; }
+      }
+
+      renderer.render(scene, camera);
+      drawOverlay();
+    }
+
+    /* ========= Resize ========= */
+    function resize() {
+      const w = window.innerWidth, h = window.innerHeight;
+      camera.aspect = w / h; camera.updateProjectionMatrix();
+      renderer.setSize(w, h, false);
+      overlay.width = Math.floor(w * DPR);
+      overlay.height = Math.floor(h * DPR);
+      overlay.style.width = w + 'px';
+      overlay.style.height = h + 'px';
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    /* ========= Inicio ========= */
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      try {
+        await startCamera();
+        startBtn.classList.add('hidden');
+        toast.classList.remove('hidden');
+        loop();
+      } catch (err) {
+        alert('No se pudo iniciar la cámara: ' + err);
+        startBtn.disabled = false;
+      }
+    });
+
+    // Teclas útiles
+    window.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'r') {
+        for (let i = targetBodies.length - 1; i >= 0; i--) {
+          world.removeBody(targetBodies[i]); scene.remove(targets[i]);
+          targetBodies.splice(i,1); targets.splice(i,1);
+        }
+        addTargets(); score = 0; scoreEl.textContent = '0';
+      }
+      if (k === 'e') { addStructures(); }
+      if (k === 'h') { webcamEl.classList.toggle('hidden'); }
+    });
+
+    // Limpieza si recargas
+    window.__GOMERA__.dispose = () => { cancelAnimationFrame(RAF); try { mpCamera?.stop(); } catch {}; };
+  </script>
+</body>
+</html>
